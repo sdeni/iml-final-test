@@ -113,9 +113,18 @@ def all_ok_task():
 @task
 def bad_performance_task(train_history):
     print('Model performance is bad!')
+    plt.ylabel('RMSE')
+    plt.xlabel('Epoch')
+    
     plt.plot(train_history.x, train_history.history)
     plt.savefig('reports/train-log.png')
 
+
+@flow(task_runner=SequentialTaskRunner())
+def check_performance_subflow(error, train_history):
+    threshold = 5.0
+    if error > threshold:
+        bad_performance_task(train_history)
 
 @flow(task_runner=SequentialTaskRunner())
 def nyc_duration_flow():
@@ -129,11 +138,13 @@ def nyc_duration_flow():
 
     print(f"Model quality: {rmse}")
 
-    threshold = 5.0
 
-    if rmse > threshold:
-        bad_performance_task(train_history)
-    else:
-        all_ok_task()
+    check_performance_subflow(rmse, train_history)
+
+    # Version 1
+    # if rmse > threshold:
+    #     bad_performance_task(train_history)
+    # else:
+    #     all_ok_task()
 
 nyc_duration_flow()
