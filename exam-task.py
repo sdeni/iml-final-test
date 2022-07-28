@@ -1,15 +1,21 @@
 import pandas as pd
+from pandas_profiling import ProfileReport
+import os
 
 from sklearn.metrics import mean_squared_error
 from datetime import timedelta
+
+import numpy as np
 
 import xgboost as xgb
 
 from prefect import flow, task
 from prefect.task_runners import SequentialTaskRunner
 
+import matplotlib.pyplot as plt
+
 # @task
-def looad_data(path):
+def load_data(path):
     data = pd.read_parquet(path)
     data.lpep_dropoff_datetime = pd.to_datetime(data.lpep_dropoff_datetime)
     data.lpep_pickup_datetime = pd.to_datetime(data.lpep_pickup_datetime)
@@ -22,6 +28,13 @@ def looad_data(path):
     data['DOLocationID'].astype(str, copy=False)
     return data
 
+def check_data_quality(df):
+    profile = ProfileReport(df, title="Data quality report")
+    
+    os.makedirs('reports', exist_ok=True)
+    
+    profile.to_file("reports/data-quality-report.html")
+
 # @task(retries=3)
 def generate_datasets(train_frame, val_frame):
     num_features = ['trip_distance', 'extra', 'fare_amount']
@@ -33,6 +46,27 @@ def generate_datasets(train_frame, val_frame):
     y_train = train_frame['duration']
     y_val = val_frame['duration'] 
     return X_train, X_val, y_train, y_val
+
+class TrainHistoryCollector(xgb.callback.TrainingCallback):
+    def __init__(self, rounds):
+        self.rounds = rounds
+        self.x = np.linspace(0, self.rounds, self.rounds)
+        self.history = []
+
+    def _get_key(self, data, metric):
+        return f'{data}-{metric}'
+
+    def after_iteration(self, model, epoch, evals_log):
+        
+        for data, metric in evals_log.items():
+            for metric_name, log in metric.items():
+                key = self._get_key(data, metric_name)
+                metric = log[len(log) - 1]
+                print(f"after_iteration: {epoch} {key} {metric}")
+
+                self.history.append(metric)
+
+        return False
 
 # @task
 def train_model(X_train, y_train, X_val, y_val):
@@ -48,13 +82,20 @@ def train_model(X_train, y_train, X_val, y_val):
     train = xgb.DMatrix(X_train, label=y_train)
     validation = xgb.DMatrix(X_val, label=y_val)
 
+    num_boost_round = 100
+    collector = TrainHistoryCollector(num_boost_round)
+
     booster = xgb.train(
         params = best_params,
         dtrain = train,
         evals = [(validation, "validation")],
-        num_boost_round = 100,
+        num_boost_round = num_boost_round,
         early_stopping_rounds = 50,
+        callbacks=[collector]
     )
+
+    plt.plot(collector.x, collector.history)
+    plt.savefig('reports/train-log.png')
 
     y_preds = booster.predict(validation)
     rmse = mean_squared_error(y_preds, y_val, squared=False)
@@ -67,16 +108,29 @@ def estimate_quality(model, X_val, y_val):
     y_pred = model.predict(validation)
     return mean_squared_error(y_pred, y_val, squared=False)
 
+def all_good_task():
+    print('ALL_GOOD_TASK')
+
+def smth_bad_task():
+    print('SOMETHING_IS_BAD_TASK')
+
 # @flow(task_runner=SequentialTaskRunner())
 def nyc_duration_flow():
-    train_frame = looad_data('green_tripdata_2021-01.parquet')
-    val_frame = looad_data('green_tripdata_2021-02.parquet')
+    train_frame = load_data('green_tripdata_2021-01.parquet')
+    check_data_quality(train_frame)
+
+    val_frame = load_data('green_tripdata_2021-02.parquet')
     X_train, X_val, y_train, y_val = generate_datasets(train_frame, val_frame) #.result()
     model = train_model(X_train, y_train, X_val, y_val)
     rmse = estimate_quality(model, X_val, y_val)
 
     print(f"Model quality: {rmse}")
 
-# pandas-profiling
+    threshold = 5.0
+
+    if rmse > threshold:
+        smth_bad_task()
+    else:
+        all_good_task()
 
 nyc_duration_flow()
