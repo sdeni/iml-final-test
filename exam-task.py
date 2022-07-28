@@ -14,7 +14,7 @@ from prefect.task_runners import SequentialTaskRunner
 
 import matplotlib.pyplot as plt
 
-# @task
+@task
 def load_data(path):
     data = pd.read_parquet(path)
     data.lpep_dropoff_datetime = pd.to_datetime(data.lpep_dropoff_datetime)
@@ -28,6 +28,7 @@ def load_data(path):
     data['DOLocationID'].astype(str, copy=False)
     return data
 
+@task
 def check_data_quality(df):
     profile = ProfileReport(df, title="Data quality report")
     
@@ -35,7 +36,7 @@ def check_data_quality(df):
     
     profile.to_file("reports/data-quality-report.html")
 
-# @task(retries=3)
+@task(retries=3)
 def generate_datasets(train_frame, val_frame):
     num_features = ['trip_distance', 'extra', 'fare_amount']
     cat_features = ['PULocationID', 'DOLocationID']
@@ -68,7 +69,7 @@ class TrainHistoryCollector(xgb.callback.TrainingCallback):
 
         return False
 
-# @task
+@task
 def train_model(X_train, y_train, X_val, y_val):
     best_params = {
         'max_depth': 5,
@@ -83,7 +84,7 @@ def train_model(X_train, y_train, X_val, y_val):
     validation = xgb.DMatrix(X_val, label=y_val)
 
     num_boost_round = 100
-    collector = TrainHistoryCollector(num_boost_round)
+    train_history = TrainHistoryCollector(num_boost_round)
 
     booster = xgb.train(
         params = best_params,
@@ -91,46 +92,48 @@ def train_model(X_train, y_train, X_val, y_val):
         evals = [(validation, "validation")],
         num_boost_round = num_boost_round,
         early_stopping_rounds = 50,
-        callbacks=[collector]
+        callbacks=[train_history]
     )
-
-    plt.plot(collector.x, collector.history)
-    plt.savefig('reports/train-log.png')
 
     y_preds = booster.predict(validation)
     rmse = mean_squared_error(y_preds, y_val, squared=False)
 
-    return booster
+    return (booster, train_history)
 
-# @task
+@task
 def estimate_quality(model, X_val, y_val):
     validation = xgb.DMatrix(X_val, label=y_val)
     y_pred = model.predict(validation)
     return mean_squared_error(y_pred, y_val, squared=False)
 
-def all_good_task():
+@task
+def all_ok_task():
     print('ALL_GOOD_TASK')
 
-def smth_bad_task():
-    print('SOMETHING_IS_BAD_TASK')
+@task
+def bad_performance_task(train_history):
+    print('Model performance is bad!')
+    plt.plot(train_history.x, train_history.history)
+    plt.savefig('reports/train-log.png')
 
-# @flow(task_runner=SequentialTaskRunner())
+
+@flow(task_runner=SequentialTaskRunner())
 def nyc_duration_flow():
     train_frame = load_data('green_tripdata_2021-01.parquet')
     check_data_quality(train_frame)
 
     val_frame = load_data('green_tripdata_2021-02.parquet')
-    X_train, X_val, y_train, y_val = generate_datasets(train_frame, val_frame) #.result()
-    model = train_model(X_train, y_train, X_val, y_val)
-    rmse = estimate_quality(model, X_val, y_val)
+    X_train, X_val, y_train, y_val = generate_datasets(train_frame, val_frame).result()
+    model, train_history = train_model(X_train, y_train, X_val, y_val).result()
+    rmse = estimate_quality(model, X_val, y_val).result()
 
     print(f"Model quality: {rmse}")
 
     threshold = 5.0
 
     if rmse > threshold:
-        smth_bad_task()
+        bad_performance_task(train_history)
     else:
-        all_good_task()
+        all_ok_task()
 
 nyc_duration_flow()
